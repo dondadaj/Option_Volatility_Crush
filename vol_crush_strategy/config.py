@@ -32,7 +32,7 @@ SECTOR_IV_CACHE_DIR = os.path.join(VOL_CRUSH_DIR, 'sector_iv_cache')
 ML_READY_DIR = os.path.join(DATA_DIR, 'ml_ready')
 
 # Pilot data (NVDA single-stock proof-of-concept)
-PILOT_DIR = os.path.join(_REPO_ROOT, 'option_volatility_crush.ipynb')
+PILOT_DIR = os.path.join(_REPO_ROOT, 'notebooks')
 PILOT_DATA_DIR = os.path.join(PILOT_DIR, 'pilot_data')
 
 # =============================================================================

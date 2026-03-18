@@ -6,10 +6,7 @@ Uses a small sample of synthetic earnings events to test each stage.
 
 Usage:
     cd Option_Volatility_Crush
-    python -m vol_crush_strategy.test_market_vol_context
-
-    Or from the repo root:
-    python -m pytest vol_crush_strategy/test_market_vol_context.py -v
+    python -m pytest tests/test_market_vol_context.py -v
 """
 
 import sys

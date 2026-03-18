@@ -18,16 +18,18 @@ vol_crush_strategy/
 ├── __init__.py                  # Package exports (public API surface)
 ├── config.py                    # Central configuration — API keys, paths, ETF maps, thresholds
 ├── market_vol_context.py        # Core module — VIX features, sector IV, relative IV
-├── test_market_vol_context.py   # Smoke test suite (run to verify everything works)
 └── README.md                    # This file
+
+tests/
+└── test_market_vol_context.py   # Smoke test suite (run to verify everything works)
 ```
 
 ### No Original Files Modified
 
 The following files were **NOT touched**:
-- `option_volatility_crush.ipynb/vol_crush_utils.py`
-- `option_volatility_crush.ipynb/vol_crush_pilot.ipynb`
-- All pilot CSVs in `option_volatility_crush.ipynb/pilot_data/`
+- `notebooks/vol_crush_utils.py`
+- `notebooks/vol_crush_pilot.ipynb`
+- All pilot CSVs in `notebooks/pilot_data/`
 - `.env.example`
 - Root `README.md`
 
@@ -286,7 +288,7 @@ result = add_market_wide_vol_features(
 from vol_crush_strategy import add_market_wide_vol_features, ALPHA_VANTAGE_API_KEY
 
 # Pilot data has no 'sector' column — pipeline skips sector IV gracefully
-pilot_df = pd.read_csv('option_volatility_crush.ipynb/pilot_data/07_labeled_dataset.csv')
+pilot_df = pd.read_csv('notebooks/pilot_data/07_labeled_dataset.csv')
 pilot_df['announcement_date'] = pd.to_datetime(pilot_df['announcement_date'])
 
 result = add_market_wide_vol_features(pilot_df, api_key=ALPHA_VANTAGE_API_KEY)
@@ -299,7 +301,7 @@ result = add_market_wide_vol_features(pilot_df, api_key=ALPHA_VANTAGE_API_KEY)
 
 ```bash
 cd Option_Volatility_Crush
-python -m vol_crush_strategy.test_market_vol_context
+python -m pytest tests/test_market_vol_context.py -v
 ```
 
 The test suite verifies:

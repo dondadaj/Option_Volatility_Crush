@@ -22,5 +22,8 @@ data/vol_crush/sector_iv_cache/
 .DS_Store
 Thumbs.db
 
+# Notebook API cache
+notebooks/cache/
+
 # Jupyter
 .ipynb_checkpoints/
