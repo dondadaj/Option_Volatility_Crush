@@ -45,11 +45,12 @@ NVDA shows a strong and consistent vol crush pattern -- the actual post-earnings
 ## Project Structure
 
 ```
-notebooks/
+option_volatility_crush.ipynb/
 ├── README.md                          <- This file
 ├── vol_crush_pilot.ipynb              <- Main notebook (13 cells)
 ├── vol_crush_utils.py                 <- Utility module (API, IV, metrics, theme)
 ├── how_to_trade_volatility_crush_option_strategy.ipynb  <- Reference notebook
+├── .gitignore                         <- Excludes cache/
 ├── pilot_data/                        <- All saved outputs (committed to git)
 │   ├── 01_nvda_earnings_events.csv    <- 26 deduped earnings events
 │   ├── 02_nvda_earnings_features.csv  <- 50 existing ML features for NVDA
@@ -141,7 +142,7 @@ Second run: loads everything from CSVs (~1 sec, zero API calls).
 ## How to Run
 
 ```bash
-cd notebooks/
+cd option_volatility_crush.ipynb/
 jupyter notebook vol_crush_pilot.ipynb
 # Run All Cells
 ```

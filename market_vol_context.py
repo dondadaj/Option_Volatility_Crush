@@ -19,9 +19,15 @@ of features:
 All features use only data available before each earnings event.
 No forward-looking data leakage.
 
+Requirements:
+    numpy, pandas, scipy, yfinance, requests
+
 Usage:
-    from vol_crush_strategy.market_vol_context import add_market_wide_vol_features
+    from market_vol_context import add_market_wide_vol_features
     df = add_market_wide_vol_features(earnings_df, api_key='YOUR_KEY')
+
+Tests:
+    python market_vol_context.py
 """
 
 import os
@@ -35,20 +41,133 @@ from datetime import datetime, timedelta
 from scipy.optimize import brentq
 from scipy.stats import norm
 
-from .config import (
-    VIX_TICKER, VIX3M_TICKER, VIX_LOOKBACK_START,
-    VIX_PERCENTILE_WINDOW_DAYS, VIX_SHORT_MOMENTUM_DAYS,
-    VIX_MEDIUM_MOMENTUM_DAYS, VIX_BACKWARDATION_THRESHOLD,
-    SECTOR_ETF_MAP, SUBSECTOR_ETF_MAP,
-    SECTOR_IV_MIN_DTE, SECTOR_IV_MAX_DTE,
-    DEFAULT_RISK_FREE_RATE, AV_REQUEST_DELAY_SECONDS,
-    IV_ELEVATED_VS_SECTOR_THRESHOLD,
-    VIX_CACHE_DIR, SECTOR_IV_CACHE_DIR,
-    VIX_FEATURE_NAMES, FEATURE_VALIDATION_RANGES,
-    STRADDLE_PCT_MULTIPLIER,
-    PILOT_STOCK_IV_COL, PILOT_STOCK_STRADDLE_COL,
-    get_sector_etf,
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# API Keys — set via environment variables or hardcode for development
+ALPHA_VANTAGE_API_KEY = (
+    os.environ.get('ALPHA_VANTAGE_API')
+    or os.environ.get('ALPHA_VANTAGE_API_KEY')
+    or os.environ.get('AV_API_KEY')
+    or 'YOUR_KEY_HERE'
 )
+FMP_API_KEY = os.environ.get('FMP_API_KEY', 'YOUR_KEY_HERE')
+
+# Data Paths
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_REPO_ROOT, 'data')
+VOL_CRUSH_DIR = os.path.join(DATA_DIR, 'vol_crush')
+VIX_CACHE_DIR = os.path.join(VOL_CRUSH_DIR, 'vix_cache')
+SECTOR_IV_CACHE_DIR = os.path.join(VOL_CRUSH_DIR, 'sector_iv_cache')
+ML_READY_DIR = os.path.join(DATA_DIR, 'ml_ready')
+
+# Pilot data (NVDA single-stock proof-of-concept)
+PILOT_DIR = os.path.join(_REPO_ROOT, 'option_volatility_crush.ipynb')
+PILOT_DATA_DIR = os.path.join(PILOT_DIR, 'pilot_data')
+
+# Pilot Data Column Names
+PILOT_STOCK_IV_COL = 'iv_avg_pre'
+PILOT_STOCK_STRADDLE_COL = 'straddle_pct_pre'
+PILOT_DATE_COL = 'announcement_date'
+
+# Sector ETF Mapping — GICS sectors to liquid sector ETFs
+SECTOR_ETF_MAP = {
+    'Technology':              'XLK',
+    'Information Technology':  'XLK',
+    'Communication Services':  'XLC',
+    'Consumer Discretionary':  'XLY',
+    'Consumer Staples':        'XLP',
+    'Energy':                  'XLE',
+    'Financials':              'XLF',
+    'Health Care':             'XLV',
+    'Healthcare':              'XLV',
+    'Industrials':             'XLI',
+    'Materials':               'XLB',
+    'Real Estate':             'XLRE',
+    'Utilities':               'XLU',
+}
+
+# Sub-sector ETFs for more granular IV context
+SUBSECTOR_ETF_MAP = {
+    'Semiconductors':          'SMH',
+    'Semiconductor':           'SMH',
+    'Biotech':                 'XBI',
+    'Biotechnology':           'XBI',
+    'Retail':                  'XRT',
+    'Homebuilders':            'XHB',
+    'Banks':                   'KBE',
+    'Regional Banks':          'KRE',
+    'Oil & Gas E&P':           'XOP',
+    'Oil & Gas':               'XOP',
+    'Software':                'IGV',
+    'Internet':                'FDN',
+}
+
+
+def get_sector_etf(sector=None, sub_sector=None):
+    """Resolve a sector/sub-sector label to the best sector ETF ticker."""
+    if sub_sector and sub_sector in SUBSECTOR_ETF_MAP:
+        return SUBSECTOR_ETF_MAP[sub_sector]
+    if sector and sector in SECTOR_ETF_MAP:
+        return SECTOR_ETF_MAP[sector]
+    return None
+
+
+# VIX Configuration
+VIX_TICKER = '^VIX'
+VIX3M_TICKER = '^VIX3M'
+VIX_LOOKBACK_START = '2016-01-01'
+VIX_PERCENTILE_WINDOW_DAYS = 365
+VIX_SHORT_MOMENTUM_DAYS = 5
+VIX_MEDIUM_MOMENTUM_DAYS = 21
+VIX_BACKWARDATION_THRESHOLD = 1.0
+
+# Sector IV Configuration
+SECTOR_IV_MIN_DTE = 2
+SECTOR_IV_MAX_DTE = 45
+STRADDLE_PCT_MULTIPLIER = 100
+DEFAULT_RISK_FREE_RATE = 0.05
+AV_REQUEST_DELAY_SECONDS = 0.5
+AV_FREE_TIER_DAILY_LIMIT = 25
+AV_PREMIUM_CALLS_PER_MINUTE = 75
+
+# Relative IV Feature Thresholds
+IV_ELEVATED_VS_SECTOR_THRESHOLD = 1.5
+
+# Feature Names
+VIX_FEATURE_NAMES = [
+    'vix_level', 'vix3m_level', 'vix_term_structure_ratio',
+    'vix_term_structure_regime', 'vix_percentile_252d',
+    'vix_change_5d', 'vix_change_21d',
+]
+
+SECTOR_IV_RAW_FEATURE_NAMES = [
+    'sector_etf', 'sector_atm_iv_call', 'sector_atm_iv_put',
+    'sector_atm_iv_avg', 'sector_straddle_pct',
+]
+
+SECTOR_IV_RELATIVE_FEATURE_NAMES = [
+    'iv_stock_minus_sector', 'iv_stock_sector_ratio',
+    'straddle_stock_minus_sector', 'iv_elevated_vs_sector',
+]
+
+ALL_MARKET_VOL_FEATURE_NAMES = (
+    VIX_FEATURE_NAMES + SECTOR_IV_RAW_FEATURE_NAMES + SECTOR_IV_RELATIVE_FEATURE_NAMES
+)
+
+# Validation Ranges
+FEATURE_VALIDATION_RANGES = {
+    'vix_level':                (5, 90),
+    'vix3m_level':              (5, 70),
+    'vix_term_structure_ratio': (0.5, 2.5),
+    'vix_percentile_252d':      (0.0, 1.0),
+    'vix_change_5d':            (-0.8, 3.0),
+    'vix_change_21d':           (-0.8, 5.0),
+    'sector_atm_iv_avg':        (0.01, 2.0),
+    'iv_stock_sector_ratio':    (0.1, 50.0),
+}
 
 
 # =============================================================================
@@ -81,7 +200,6 @@ def fetch_vix_data(start_date=None, end_date=None, cache=True):
         cache_file = os.path.join(VIX_CACHE_DIR, 'vix_daily.csv')
         if os.path.exists(cache_file):
             cached = pd.read_csv(cache_file, index_col=0, parse_dates=True)
-            # If cache covers our requested range, use it
             if (cached.index.min() <= pd.Timestamp(start_date) and
                     cached.index.max() >= pd.Timestamp(end_date) - pd.Timedelta(days=5)):
                 print(f"  Loaded VIX data from cache ({len(cached)} rows)")
@@ -89,21 +207,12 @@ def fetch_vix_data(start_date=None, end_date=None, cache=True):
 
     print(f"  Downloading VIX data from Yahoo Finance ({start_date} to {end_date})...")
 
-    # Download VIX
-    vix_raw = yf.download(
-        VIX_TICKER, start=start_date, end=end_date, progress=False
-    )
-    # Download VIX3M
-    vix3m_raw = yf.download(
-        VIX3M_TICKER, start=start_date, end=end_date, progress=False
-    )
+    vix_raw = yf.download(VIX_TICKER, start=start_date, end=end_date, progress=False)
+    vix3m_raw = yf.download(VIX3M_TICKER, start=start_date, end=end_date, progress=False)
 
     if vix_raw.empty:
         raise ValueError(f"Failed to download {VIX_TICKER} data from Yahoo Finance")
 
-    # Handle both single-ticker and multi-ticker yfinance column formats.
-    # yfinance may return either a simple Index or a MultiIndex depending
-    # on version and how many tickers were requested.
     def _extract_close(df, ticker_label):
         if df.empty:
             return pd.Series(dtype=float)
@@ -114,29 +223,20 @@ def fetch_vix_data(start_date=None, end_date=None, cache=True):
         if 'Close' in cols:
             s = df['Close']
             return s.iloc[:, 0] if hasattr(s, 'iloc') and s.ndim > 1 else s
-        # Fallback: first column
         return df.iloc[:, 0]
 
     vix_close = _extract_close(vix_raw, VIX_TICKER).rename('vix_close')
     vix3m_close = _extract_close(vix3m_raw, VIX3M_TICKER).rename('vix3m_close')
 
-    # Merge on date index
     combined = pd.DataFrame(vix_close).join(pd.DataFrame(vix3m_close), how='outer')
-
-    # Forward-fill gaps (VIX3M occasionally has missing days)
     combined = combined.ffill()
-
-    # Drop any rows where VIX itself is NaN (shouldn't happen but safety)
     combined = combined.dropna(subset=['vix_close'])
-
-    # Ensure numeric
     combined['vix_close'] = pd.to_numeric(combined['vix_close'], errors='coerce')
     combined['vix3m_close'] = pd.to_numeric(combined['vix3m_close'], errors='coerce')
 
     print(f"  Downloaded {len(combined)} rows of VIX data "
           f"({combined.index.min().date()} to {combined.index.max().date()})")
 
-    # Save to cache
     if cache:
         combined.to_csv(cache_file)
         print(f"  Cached VIX data to {cache_file}")
@@ -156,7 +256,6 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
 
     Parameters:
         earnings_df: DataFrame containing earnings events.
-                     Must have a date column (datetime or string).
         vix_df: DataFrame from fetch_vix_data() with vix_close, vix3m_close.
         date_col: name of the date column in earnings_df.
 
@@ -165,16 +264,11 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
     """
     print(f"  Computing VIX features for {len(earnings_df)} events...")
 
-    # Pre-sort VIX data for efficient lookups
     vix_sorted = vix_df.sort_index()
-
-    # Pre-compute results as lists (faster than row-by-row DataFrame ops)
     results = {name: [] for name in VIX_FEATURE_NAMES}
 
     for idx, row in earnings_df.iterrows():
         event_date = pd.Timestamp(row[date_col])
-
-        # Get all VIX data up to and including event date
         mask = vix_sorted.index <= event_date
         available = vix_sorted.loc[mask]
 
@@ -183,37 +277,26 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
                 results[name].append(np.nan)
             continue
 
-        # Most recent VIX data point
         latest = available.iloc[-1]
         latest_date = available.index[-1]
         vix_level = float(latest['vix_close'])
         vix3m_level = float(latest['vix3m_close']) if pd.notna(latest['vix3m_close']) else np.nan
 
-        # ---- Feature 1: Raw VIX level ----
         results['vix_level'].append(vix_level)
-
-        # ---- Feature 2: Raw VIX3M level ----
         results['vix3m_level'].append(vix3m_level)
 
-        # ---- Feature 3: VIX term structure ratio ----
-        # > 1.0 = backwardation (near-term panic)
-        # < 1.0 = contango (normal, calm)
         if pd.notna(vix3m_level) and vix3m_level > 0:
             ts_ratio = vix_level / vix3m_level
         else:
             ts_ratio = np.nan
         results['vix_term_structure_ratio'].append(ts_ratio)
 
-        # ---- Feature 4: Binary regime flag ----
-        # 1 = backwardation (stressed market), 0 = contango (normal)
         if pd.notna(ts_ratio):
             regime = 1 if ts_ratio > VIX_BACKWARDATION_THRESHOLD else 0
         else:
             regime = np.nan
         results['vix_term_structure_regime'].append(regime)
 
-        # ---- Feature 5: VIX percentile over trailing 252 trading days ----
-        # Where does today's VIX sit relative to the past year?
         lookback_start = latest_date - pd.Timedelta(days=VIX_PERCENTILE_WINDOW_DAYS)
         trailing = available.loc[available.index >= lookback_start, 'vix_close']
 
@@ -223,9 +306,7 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
             pctl = np.nan
         results['vix_percentile_252d'].append(pctl)
 
-        # ---- Feature 6: VIX 5-day change (short-term momentum) ----
-        # Is fear rising or falling heading into this earnings?
-        n_short = VIX_SHORT_MOMENTUM_DAYS + 1  # need n+1 rows for n-day change
+        n_short = VIX_SHORT_MOMENTUM_DAYS + 1
         if len(available) >= n_short:
             vix_prev = float(available.iloc[-n_short]['vix_close'])
             change_5d = (vix_level - vix_prev) / vix_prev if vix_prev > 0 else np.nan
@@ -233,7 +314,6 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
             change_5d = np.nan
         results['vix_change_5d'].append(change_5d)
 
-        # ---- Feature 7: VIX 21-day change (medium-term trend) ----
         n_med = VIX_MEDIUM_MOMENTUM_DAYS + 1
         if len(available) >= n_med:
             vix_prev_21 = float(available.iloc[-n_med]['vix_close'])
@@ -242,7 +322,6 @@ def compute_vix_features(earnings_df, vix_df, date_col='announcement_date'):
             change_21d = np.nan
         results['vix_change_21d'].append(change_21d)
 
-    # Build features DataFrame and concatenate
     vix_features = pd.DataFrame(results, index=earnings_df.index)
 
     print(f"  VIX features computed. Coverage: "
@@ -281,7 +360,6 @@ def implied_vol(price, S, K, T, r, option_type='call'):
         else:
             return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
-    # Intrinsic value check: option price must exceed intrinsic
     if option_type == 'call':
         intrinsic = max(S - K * np.exp(-r * T), 0)
     else:
@@ -327,7 +405,6 @@ def fetch_option_chain_av(symbol, date_str, api_key):
         resp.raise_for_status()
         data = resp.json()
 
-        # Alpha Vantage returns errors in JSON with specific keys
         if 'Error Message' in data or 'Note' in data:
             note = data.get('Error Message') or data.get('Note', '')
             if 'rate limit' in note.lower() or 'call frequency' in note.lower():
@@ -342,21 +419,9 @@ def fetch_option_chain_av(symbol, date_str, api_key):
 
 
 def _get_etf_price(symbol, date_str):
-    """
-    Get the closing price of an ETF on a specific date via Yahoo Finance.
-
-    Falls back to the most recent prior trading day if the exact date
-    is a weekend or holiday.
-
-    Parameters:
-        symbol: ETF ticker
-        date_str: 'YYYY-MM-DD'
-
-    Returns:
-        float: closing price, or np.nan if unavailable
-    """
+    """Get the closing price of an ETF on a specific date via Yahoo Finance."""
     target = pd.Timestamp(date_str)
-    start = target - pd.Timedelta(days=10)  # buffer for weekends/holidays
+    start = target - pd.Timedelta(days=10)
 
     try:
         data = yf.download(
@@ -368,7 +433,6 @@ def _get_etf_price(symbol, date_str):
         if data.empty:
             return np.nan
 
-        # Handle MultiIndex columns from yfinance
         if isinstance(data.columns, pd.MultiIndex):
             close_col = data['Close']
             if close_col.ndim > 1:
@@ -386,8 +450,6 @@ def _get_etf_price(symbol, date_str):
         return np.nan
 
 
-# In-memory ETF price cache to avoid redundant Yahoo Finance calls.
-# Persists for the duration of the Python process (not across runs).
 _etf_price_cache = {}
 
 
@@ -431,7 +493,6 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
 
     chain_date = datetime.strptime(chain_date_str, '%Y-%m-%d')
 
-    # Step 1: Filter contracts to valid DTE window
     valid_contracts = []
     for c in chain:
         try:
@@ -445,7 +506,6 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
     if not valid_contracts:
         return empty_result
 
-    # Step 2: Find ATM strike (closest to ETF price)
     strikes = set()
     for c in valid_contracts:
         try:
@@ -458,7 +518,6 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
 
     atm_strike = min(strikes, key=lambda k: abs(k - etf_price))
 
-    # Step 3: Extract ATM call and put prices
     atm_call_price = np.nan
     atm_put_price = np.nan
     expiration_str = None
@@ -468,7 +527,6 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
             if float(c['strike']) != atm_strike:
                 continue
 
-            # Prefer mid price (bid+ask)/2, fall back to last traded
             bid = float(c.get('bid', 0) or 0)
             ask = float(c.get('ask', 0) or 0)
             if bid > 0 and ask > 0:
@@ -490,14 +548,12 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
         except (KeyError, ValueError):
             continue
 
-    # Step 4: Compute time to expiration
     if expiration_str:
         exp_dt = datetime.strptime(expiration_str, '%Y-%m-%d')
         T = max((exp_dt - chain_date).days / 365.0, 1 / 365)
     else:
-        T = 30 / 365  # fallback ~30 days
+        T = 30 / 365
 
-    # Step 5: Compute IV for call and put
     iv_call = np.nan
     iv_put = np.nan
 
@@ -511,11 +567,9 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
             atm_put_price, etf_price, atm_strike, T, risk_free_rate, 'put'
         )
 
-    # Step 6: Average IV (standard: average call and put ATM IV)
     ivs = [v for v in [iv_call, iv_put] if not np.isnan(v)]
     iv_avg = float(np.mean(ivs)) if ivs else np.nan
 
-    # Step 7: Straddle as % of ETF price
     straddle = 0
     n_legs = 0
     if not np.isnan(atm_call_price) and atm_call_price > 0:
@@ -525,13 +579,9 @@ def compute_sector_etf_iv(chain, etf_price, chain_date_str,
         straddle += atm_put_price
         n_legs += 1
 
-    # Only compute if we have both legs (or at least one with doubling estimate)
-    # Multiply by STRADDLE_PCT_MULTIPLIER (100) to output PERCENTAGE POINTS,
-    # matching the pilot convention: straddle_pct_pre = 7.4 means 7.4% of price.
     if n_legs == 2:
         straddle_pct = (straddle / etf_price) * STRADDLE_PCT_MULTIPLIER
     elif n_legs == 1:
-        # Approximate: if only one leg, double it (ATM call ~ ATM put)
         straddle_pct = ((straddle * 2) / etf_price) * STRADDLE_PCT_MULTIPLIER
     else:
         straddle_pct = np.nan
@@ -553,18 +603,7 @@ def get_sector_iv_for_event(sector, event_date, api_key,
     """
     Get sector ETF ATM IV for a given sector and date.
 
-    Uses file-based caching to avoid redundant API calls. Each unique
-    (ETF, date) pair is fetched once and cached permanently.
-
-    Parameters:
-        sector: GICS sector string (e.g., 'Technology')
-        event_date: datetime-like or string 'YYYY-MM-DD'
-        api_key: Alpha Vantage API key
-        sub_sector: optional sub-sector for more granular ETF matching
-        risk_free_rate: for BS IV inversion
-
-    Returns:
-        dict with sector_etf + IV feature values
+    Uses file-based caching to avoid redundant API calls.
     """
     etf_symbol = get_sector_etf(sector=sector, sub_sector=sub_sector)
 
@@ -582,31 +621,23 @@ def get_sector_iv_for_event(sector, event_date, api_key,
 
     date_str = pd.Timestamp(event_date).strftime('%Y-%m-%d')
 
-    # Check file cache
     os.makedirs(SECTOR_IV_CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(SECTOR_IV_CACHE_DIR, f'{etf_symbol}_{date_str}.json')
 
     if os.path.exists(cache_file):
         with open(cache_file, 'r') as f:
             cached = json.load(f)
-        # Convert None back to NaN for consistency
         for key in cached:
             if cached[key] is None and key != 'sector_etf':
                 cached[key] = np.nan
         cached['sector_etf'] = etf_symbol
         return cached
 
-    # Fetch option chain from Alpha Vantage
     chain = fetch_option_chain_av(etf_symbol, date_str, api_key)
-
-    # Get the ETF closing price on that date
     etf_price = get_etf_price_cached(etf_symbol, date_str)
-
-    # Compute ATM IV
     result = compute_sector_etf_iv(chain, etf_price, date_str, risk_free_rate)
     result['sector_etf'] = etf_symbol
 
-    # Cache to disk (convert NaN to None for JSON serialization)
     cache_data = {}
     for key, val in result.items():
         if isinstance(val, float) and np.isnan(val):
@@ -617,7 +648,6 @@ def get_sector_iv_for_event(sector, event_date, api_key,
     with open(cache_file, 'w') as f:
         json.dump(cache_data, f, indent=2)
 
-    # Rate limit courtesy
     time.sleep(AV_REQUEST_DELAY_SECONDS)
 
     return result
@@ -626,25 +656,9 @@ def get_sector_iv_for_event(sector, event_date, api_key,
 def add_sector_iv_features(earnings_df, api_key,
                            sector_col='sector', sub_sector_col=None,
                            date_col='announcement_date'):
-    """
-    Add sector-level IV features to every earnings event.
-
-    For each event, resolves the sector to a sector ETF, fetches the
-    option chain, and computes ATM IV. Results are cached per (ETF, date).
-
-    Parameters:
-        earnings_df: DataFrame with sector and date columns
-        api_key: Alpha Vantage API key
-        sector_col: name of column containing GICS sector labels
-        sub_sector_col: optional column for sub-sector (e.g., 'Semiconductors')
-        date_col: name of column containing announcement dates
-
-    Returns:
-        earnings_df with 5 new sector IV columns appended.
-    """
+    """Add sector-level IV features to every earnings event."""
     print(f"  Computing sector IV features for {len(earnings_df)} events...")
 
-    # Count unique (ETF, date) pairs to estimate API calls needed
     unique_pairs = set()
     for _, row in earnings_df.iterrows():
         sector = row.get(sector_col, '')
@@ -654,7 +668,6 @@ def add_sector_iv_features(earnings_df, api_key,
         if etf:
             unique_pairs.add((etf, date))
 
-    # Check how many are already cached
     uncached = 0
     for etf, date in unique_pairs:
         cache_file = os.path.join(SECTOR_IV_CACHE_DIR, f'{etf}_{date}.json')
@@ -664,7 +677,6 @@ def add_sector_iv_features(earnings_df, api_key,
     print(f"  Unique (ETF, date) pairs: {len(unique_pairs)} "
           f"({uncached} uncached, will need API calls)")
 
-    # Compute features per event (get_sector_iv_for_event handles caching)
     sector_features = []
     for i, (idx, row) in enumerate(earnings_df.iterrows()):
         sector = row.get(sector_col, '')
@@ -672,10 +684,8 @@ def add_sector_iv_features(earnings_df, api_key,
         event_date = row[date_col]
 
         result = get_sector_iv_for_event(
-            sector=sector,
-            event_date=event_date,
-            api_key=api_key,
-            sub_sector=sub,
+            sector=sector, event_date=event_date,
+            api_key=api_key, sub_sector=sub,
         )
         sector_features.append(result)
 
@@ -702,34 +712,16 @@ def compute_relative_iv_features(df,
     """
     Compute features that compare stock-level IV to sector-level IV.
 
-    These relative features are where the strongest signal typically lives.
-    A stock with 80% IV when its sector ETF is at 20% has a 4x ratio,
-    indicating a massive earnings-specific premium. A stock at 30% when
-    sector is at 25% (1.2x ratio) has a small one.
-
     NOTE: Mutates df in-place and also returns it for chaining.
-
-    Parameters:
-        df: DataFrame with both stock-level and sector-level IV features
-        stock_iv_col: column name for the stock's pre-event ATM IV
-        stock_straddle_col: column name for stock's straddle as % of price
-        sector_iv_col: column name for sector ETF ATM IV
-        sector_straddle_col: column name for sector ETF straddle %
-
-    Returns:
-        df with 4 new relative feature columns appended.
     """
     print("  Computing relative IV features (stock vs. sector)...")
 
-    # Feature 1: IV spread (stock minus sector)
-    # Positive = stock has more IV than sector (earnings-specific premium)
     if stock_iv_col in df.columns and sector_iv_col in df.columns:
         df['iv_stock_minus_sector'] = df[stock_iv_col] - df[sector_iv_col]
     else:
         df['iv_stock_minus_sector'] = np.nan
         warnings.warn(f"Missing columns for IV spread: need '{stock_iv_col}' and '{sector_iv_col}'")
 
-    # Feature 2: IV ratio (stock / sector)
     if stock_iv_col in df.columns and sector_iv_col in df.columns:
         df['iv_stock_sector_ratio'] = np.where(
             df[sector_iv_col] > 0,
@@ -739,7 +731,6 @@ def compute_relative_iv_features(df,
     else:
         df['iv_stock_sector_ratio'] = np.nan
 
-    # Feature 3: Straddle premium relative to sector
     if stock_straddle_col in df.columns and sector_straddle_col in df.columns:
         df['straddle_stock_minus_sector'] = (
             df[stock_straddle_col] - df[sector_straddle_col]
@@ -747,7 +738,6 @@ def compute_relative_iv_features(df,
     else:
         df['straddle_stock_minus_sector'] = np.nan
 
-    # Feature 4: Binary flag — is stock IV elevated vs. sector?
     if 'iv_stock_sector_ratio' in df.columns:
         df['iv_elevated_vs_sector'] = np.where(
             df['iv_stock_sector_ratio'].notna(),
@@ -770,22 +760,10 @@ def handle_market_vol_missing_data(df, model_type='tree'):
 
     Strategy depends on model type:
     - Tree-based models (LightGBM, XGBoost): leave sector IV NaN as-is
-      (native support), forward-fill VIX (nearly complete, gaps are rare)
     - Linear models (LR, RF): median-impute sector IV columns
-
-    VIX forward-fill and regime fill-with-0 happen for both model types
-    because VIX data is market-wide and should always be present.
-
-    Parameters:
-        df: DataFrame with market vol features
-        model_type: 'tree' for LightGBM/XGBoost, 'linear' for LR/RF
-
-    Returns:
-        df with missing values handled
     """
     print(f"  Handling missing data (strategy: {model_type})...")
 
-    # VIX features: forward-fill first (data is very complete, gaps are rare)
     vix_numeric_cols = [
         'vix_level', 'vix3m_level', 'vix_term_structure_ratio',
         'vix_percentile_252d', 'vix_change_5d', 'vix_change_21d'
@@ -798,11 +776,9 @@ def handle_market_vol_missing_data(df, model_type='tree'):
             if before_na > after_na:
                 print(f"    {col}: filled {before_na - after_na} NaN via forward-fill")
 
-    # Binary regime: fill with 0 (assume contango/normal if unknown)
     if 'vix_term_structure_regime' in df.columns:
         df['vix_term_structure_regime'] = df['vix_term_structure_regime'].fillna(0)
 
-    # Sector IV features: strategy depends on model type
     sector_cols = [
         'sector_atm_iv_call', 'sector_atm_iv_put', 'sector_atm_iv_avg',
         'sector_straddle_pct', 'iv_stock_minus_sector', 'iv_stock_sector_ratio',
@@ -818,7 +794,6 @@ def handle_market_vol_missing_data(df, model_type='tree'):
                     df[col] = df[col].fillna(median_val)
                     print(f"    {col}: filled {before_na} NaN with median ({median_val:.4f})")
     else:
-        # Tree models: leave NaN, just report coverage
         for col in sector_cols:
             if col in df.columns:
                 na_count = df[col].isna().sum()
@@ -833,18 +808,7 @@ def handle_market_vol_missing_data(df, model_type='tree'):
 # =============================================================================
 
 def validate_market_vol_features(df):
-    """
-    Sanity-check the market-wide volatility features.
-
-    Prints a summary of range, coverage, and out-of-bounds values.
-    Use this after computing features and before training.
-
-    Parameters:
-        df: DataFrame with market vol features
-
-    Returns:
-        dict: validation summary per feature
-    """
+    """Sanity-check the market-wide volatility features."""
     print("\n  === Market-Wide Vol Feature Validation ===\n")
 
     summary = {}
@@ -904,9 +868,6 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
     """
     Master function: adds all market-wide volatility context features.
 
-    Call this AFTER you've computed stock-level IV features (iv_avg_pre,
-    straddle_pct_pre, etc.) but BEFORE model training.
-
     Pipeline:
         1. Fetch VIX/VIX3M data (Yahoo Finance, free)
         2. Compute 7 VIX-based regime features
@@ -915,26 +876,6 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
         5. Compute 4 relative stock-vs-sector features
         6. Handle missing data
         7. Validate feature ranges
-
-    Parameters:
-        earnings_df: DataFrame with stock-level features already computed
-        api_key: Alpha Vantage API key (for sector ETF chains).
-                 If None or 'YOUR_KEY_HERE', sector IV steps are skipped
-                 and only VIX features are computed.
-        date_col: column name for announcement dates
-        sector_col: column name for GICS sector labels.
-                    If this column is missing from earnings_df, sector IV
-                    steps are skipped gracefully.
-        sub_sector_col: optional column for sub-sector granularity
-        stock_iv_col: column name for stock's pre-event ATM IV
-                      (default: 'iv_avg_pre' matching pilot data)
-        stock_straddle_col: column name for stock's straddle % of price
-                            (default: 'straddle_pct_pre' matching pilot data)
-        model_type: 'tree' or 'linear' (affects NaN handling)
-        validate: if True, run validation checks and print summary
-
-    Returns:
-        DataFrame with ~15 new market-wide vol features added
     """
     print("=" * 60)
     print("MARKET-WIDE VOLATILITY CONTEXT PIPELINE")
@@ -943,7 +884,6 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
     n_events = len(earnings_df)
     print(f"\nInput: {n_events} earnings events")
 
-    # Determine whether we can run the sector IV pipeline
     has_api_key = (api_key and api_key != 'YOUR_KEY_HERE')
     has_sector_col = (sector_col and sector_col in earnings_df.columns)
 
@@ -952,15 +892,12 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
     if not has_sector_col:
         print(f"\n  NOTE: Column '{sector_col}' not found — sector IV steps will be skipped.")
 
-    # Step 1: Fetch VIX data
     print("\n[Step 1/6] Fetching VIX data...")
     vix_df = fetch_vix_data()
 
-    # Step 2: Compute VIX features
     print("\n[Step 2/6] Computing VIX features...")
     df = compute_vix_features(earnings_df, vix_df, date_col=date_col)
 
-    # Step 3: Compute sector ETF IV features (requires API key + sector column)
     if has_api_key and has_sector_col:
         print("\n[Step 3/6] Computing sector IV features...")
         df = add_sector_iv_features(
@@ -970,7 +907,6 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
             date_col=date_col
         )
 
-        # Step 4: Compute relative IV features
         print("\n[Step 4/6] Computing relative IV features...")
         df = compute_relative_iv_features(
             df,
@@ -981,11 +917,9 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
         print("\n[Step 3/6] Skipping sector IV (no API key or sector column)")
         print("[Step 4/6] Skipping relative IV features")
 
-    # Step 5: Handle missing data
     print("\n[Step 5/6] Handling missing data...")
     df = handle_market_vol_missing_data(df, model_type=model_type)
 
-    # Step 6: Validate
     if validate:
         print("\n[Step 6/6] Validating features...")
         validate_market_vol_features(df)
@@ -998,3 +932,260 @@ def add_market_wide_vol_features(earnings_df, api_key=None,
     print("=" * 60)
 
     return df
+
+
+# =============================================================================
+# TESTS — run with: python market_vol_context.py
+# =============================================================================
+
+def create_sample_earnings():
+    """Create a small synthetic earnings DataFrame for testing."""
+    data = {
+        'symbol': ['NVDA', 'AAPL', 'JPM', 'JNJ', 'XOM',
+                    'MSFT', 'AMZN', 'META', 'GOOGL', 'TSLA'],
+        'announcement_date': [
+            '2024-02-21', '2024-02-01', '2024-01-12', '2024-01-23', '2024-02-02',
+            '2024-01-30', '2024-02-01', '2024-02-01', '2024-01-30', '2024-01-24',
+        ],
+        'sector': [
+            'Technology', 'Technology', 'Financials', 'Health Care', 'Energy',
+            'Technology', 'Consumer Discretionary', 'Communication Services',
+            'Communication Services', 'Consumer Discretionary',
+        ],
+        'sub_sector': [
+            'Semiconductors', 'Technology', 'Banks', 'Healthcare', 'Oil & Gas',
+            'Software', 'Internet', 'Internet', 'Internet', 'Consumer Discretionary',
+        ],
+        'iv_avg_pre': [0.65, 0.32, 0.22, 0.18, 0.28,
+                       0.35, 0.42, 0.48, 0.38, 0.72],
+        'straddle_pct_pre': [8.0, 4.0, 3.0, 2.0, 3.5,
+                             4.5, 5.0, 6.0, 4.8, 9.0],
+    }
+
+    df = pd.DataFrame(data)
+    df['announcement_date'] = pd.to_datetime(df['announcement_date'])
+    return df
+
+
+def test_sector_etf_mapping():
+    """Test that sector-to-ETF mapping works correctly."""
+    print("\n" + "=" * 50)
+    print("TEST: Sector ETF Mapping")
+    print("=" * 50)
+
+    assert get_sector_etf(sector='Technology') == 'XLK'
+    assert get_sector_etf(sector='Financials') == 'XLF'
+    assert get_sector_etf(sector='Energy') == 'XLE'
+    print("  Basic sector mapping: PASS")
+
+    assert get_sector_etf(sector='Technology', sub_sector='Semiconductors') == 'SMH'
+    assert get_sector_etf(sector='Financials', sub_sector='Banks') == 'KBE'
+    assert get_sector_etf(sector='Health Care', sub_sector='Biotech') == 'XBI'
+    print("  Sub-sector override: PASS")
+
+    assert get_sector_etf(sector='Technology', sub_sector='Unknown') == 'XLK'
+    print("  Fallback to sector: PASS")
+
+    assert get_sector_etf(sector='Aliens') is None
+    print("  Unknown sector returns None: PASS")
+
+    print("\n  ALL MAPPING TESTS PASSED")
+
+
+def test_vix_fetch_and_features():
+    """Test VIX data fetching and feature computation."""
+    print("\n" + "=" * 50)
+    print("TEST: VIX Data Fetch & Feature Computation")
+    print("=" * 50)
+
+    vix_df = fetch_vix_data(start_date='2023-01-01', end_date='2024-12-31')
+
+    assert not vix_df.empty, "VIX data is empty"
+    assert 'vix_close' in vix_df.columns, "Missing vix_close column"
+    assert 'vix3m_close' in vix_df.columns, "Missing vix3m_close column"
+    print(f"\n  Fetched {len(vix_df)} rows of VIX data")
+    print(f"  VIX range: {vix_df['vix_close'].min():.2f} to {vix_df['vix_close'].max():.2f}")
+    print(f"  VIX3M range: {vix_df['vix3m_close'].min():.2f} to {vix_df['vix3m_close'].max():.2f}")
+
+    sample = create_sample_earnings()
+    result = compute_vix_features(sample, vix_df)
+
+    expected_cols = [
+        'vix_level', 'vix3m_level', 'vix_term_structure_ratio',
+        'vix_term_structure_regime', 'vix_percentile_252d',
+        'vix_change_5d', 'vix_change_21d'
+    ]
+    for col in expected_cols:
+        assert col in result.columns, f"Missing feature column: {col}"
+    print(f"\n  All 7 VIX feature columns present: PASS")
+
+    vix_levels = result['vix_level'].dropna()
+    assert (vix_levels > 0).all(), "VIX levels should be positive"
+    assert (vix_levels < 100).all(), "VIX levels should be < 100"
+    print(f"  VIX levels range: {vix_levels.min():.2f} to {vix_levels.max():.2f}: PASS")
+
+    ts_ratios = result['vix_term_structure_ratio'].dropna()
+    assert (ts_ratios > 0).all(), "Term structure ratio should be positive"
+    print(f"  Term structure ratios: {ts_ratios.min():.3f} to {ts_ratios.max():.3f}: PASS")
+
+    percentiles = result['vix_percentile_252d'].dropna()
+    assert (percentiles >= 0).all() and (percentiles <= 1).all(), "Percentile should be [0, 1]"
+    print(f"  VIX percentiles: {percentiles.min():.3f} to {percentiles.max():.3f}: PASS")
+
+    print("\n  ALL VIX TESTS PASSED")
+    return result
+
+
+def test_relative_iv_features():
+    """Test relative IV feature computation."""
+    print("\n" + "=" * 50)
+    print("TEST: Relative IV Features")
+    print("=" * 50)
+
+    sample = create_sample_earnings()
+    sample['sector_atm_iv_avg'] = [0.18, 0.15, 0.14, 0.12, 0.20,
+                                    0.16, 0.19, 0.21, 0.17, 0.25]
+    sample['sector_straddle_pct'] = [2.5, 2.0, 1.8, 1.5, 2.8,
+                                      2.2, 2.6, 2.9, 2.3, 3.3]
+
+    result = compute_relative_iv_features(sample)
+
+    expected = ['iv_stock_minus_sector', 'iv_stock_sector_ratio',
+                'straddle_stock_minus_sector', 'iv_elevated_vs_sector']
+    for col in expected:
+        assert col in result.columns, f"Missing: {col}"
+    print(f"  All 4 relative feature columns present: PASS")
+
+    nvda_ratio = result.iloc[0]['iv_stock_sector_ratio']
+    assert 3.5 < nvda_ratio < 3.7, f"NVDA IV ratio should be ~3.6, got {nvda_ratio}"
+    print(f"  NVDA iv_stock_sector_ratio = {nvda_ratio:.2f} (expected ~3.61): PASS")
+
+    assert result.iloc[0]['iv_elevated_vs_sector'] == 1
+    print(f"  NVDA iv_elevated_vs_sector = 1: PASS")
+
+    jnj_ratio = result.iloc[3]['iv_stock_sector_ratio']
+    print(f"  JNJ iv_stock_sector_ratio = {jnj_ratio:.2f}")
+
+    spreads = result['iv_stock_minus_sector'].dropna()
+    print(f"  IV spread range: {spreads.min():.3f} to {spreads.max():.3f}")
+
+    print("\n  ALL RELATIVE IV TESTS PASSED")
+
+
+def test_missing_data_handling():
+    """Test missing data imputation strategies."""
+    print("\n" + "=" * 50)
+    print("TEST: Missing Data Handling")
+    print("=" * 50)
+
+    sample = create_sample_earnings()
+    sample['vix_level'] = [13.5, np.nan, 14.2, 13.8, np.nan,
+                           12.9, 13.1, np.nan, 14.0, 13.7]
+    sample['vix_term_structure_regime'] = [0, np.nan, 1, 0, np.nan,
+                                            0, 0, np.nan, 1, 0]
+    sample['sector_atm_iv_avg'] = [0.18, np.nan, 0.14, np.nan, 0.20,
+                                    0.16, np.nan, 0.21, 0.17, np.nan]
+
+    tree_result = handle_market_vol_missing_data(sample.copy(), model_type='tree')
+    assert tree_result['vix_level'].iloc[1] == 13.5
+    print("  Tree model forward-fill: PASS")
+
+    assert tree_result['vix_term_structure_regime'].iloc[1] == 0
+    print("  Regime fill with 0: PASS")
+
+    assert pd.isna(tree_result['sector_atm_iv_avg'].iloc[1])
+    print("  Sector IV NaN preserved for tree model: PASS")
+
+    linear_result = handle_market_vol_missing_data(sample.copy(), model_type='linear')
+    assert not pd.isna(linear_result['sector_atm_iv_avg'].iloc[1])
+    print("  Sector IV median-imputed for linear model: PASS")
+
+    print("\n  ALL MISSING DATA TESTS PASSED")
+
+
+def test_validation():
+    """Test the validation function catches issues."""
+    print("\n" + "=" * 50)
+    print("TEST: Feature Validation")
+    print("=" * 50)
+
+    sample = create_sample_earnings()
+    sample['vix_level'] = [13.5, 14.2, 13.8, 95.0, 12.9,
+                           13.1, 14.5, 14.0, 13.7, 15.1]
+    sample['vix_percentile_252d'] = [0.45, 0.52, 0.61, 0.38, 0.72,
+                                      0.55, 0.48, 0.66, 0.59, 0.41]
+
+    summary = validate_market_vol_features(sample)
+
+    assert summary['vix_level']['out_of_range'] >= 1, "Should flag out-of-range VIX"
+    print("  Out-of-range detection: PASS")
+
+    print("\n  ALL VALIDATION TESTS PASSED")
+
+
+def run_full_pipeline_demo():
+    """Run the complete pipeline on sample data."""
+    print("\n" + "=" * 60)
+    print("FULL PIPELINE DEMO")
+    print("=" * 60)
+
+    sample = create_sample_earnings()
+    print(f"\nSample data: {len(sample)} earnings events")
+    print(sample[['symbol', 'announcement_date', 'sector', 'iv_avg_pre']].to_string())
+
+    has_api_key = (ALPHA_VANTAGE_API_KEY != 'YOUR_KEY_HERE'
+                   and ALPHA_VANTAGE_API_KEY is not None)
+
+    if has_api_key:
+        print("\n  Alpha Vantage API key detected — running full pipeline")
+        result = add_market_wide_vol_features(
+            sample,
+            api_key=ALPHA_VANTAGE_API_KEY,
+            sector_col='sector',
+            sub_sector_col='sub_sector',
+            model_type='tree',
+            validate=True,
+        )
+    else:
+        print("\n  No API key — running VIX-only pipeline with mock sector IV")
+
+        vix_df = fetch_vix_data(start_date='2023-01-01')
+        result = compute_vix_features(sample, vix_df)
+
+        np.random.seed(42)
+        result['sector_etf'] = result['sector'].map(SECTOR_ETF_MAP)
+        result['sector_atm_iv_call'] = np.random.uniform(0.12, 0.25, len(result))
+        result['sector_atm_iv_put'] = result['sector_atm_iv_call'] + np.random.uniform(-0.02, 0.02, len(result))
+        result['sector_atm_iv_avg'] = (result['sector_atm_iv_call'] + result['sector_atm_iv_put']) / 2
+        result['sector_straddle_pct'] = result['sector_atm_iv_avg'] * 15.0
+
+        result = compute_relative_iv_features(result)
+        result = handle_market_vol_missing_data(result)
+        validate_market_vol_features(result)
+
+    print("\n  FINAL FEATURE SUMMARY:")
+    market_cols = [c for c in result.columns if c.startswith(('vix_', 'sector_', 'iv_stock', 'iv_elevated', 'straddle_stock'))]
+    print(f"  New market-wide features: {len(market_cols)}")
+    for col in market_cols:
+        na = result[col].isna().sum()
+        print(f"    {col}: {na}/{len(result)} NaN")
+
+    print(f"\n  Total features: {len(result.columns)}")
+    return result
+
+
+if __name__ == '__main__':
+    print("=" * 60)
+    print("MARKET-WIDE VOLATILITY CONTEXT — TEST SUITE")
+    print("=" * 60)
+
+    test_sector_etf_mapping()
+    result = test_vix_fetch_and_features()
+    test_relative_iv_features()
+    test_missing_data_handling()
+    test_validation()
+    final = run_full_pipeline_demo()
+
+    print("\n" + "=" * 60)
+    print("ALL TESTS PASSED")
+    print("=" * 60)

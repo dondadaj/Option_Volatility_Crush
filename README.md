@@ -24,7 +24,7 @@ The project already has a robust **earnings beat prediction pipeline**:
 - `earnings_pipeline.py` fetches fundamental data from Alpha Vantage, FMP, Yahoo Finance
 - `data/ml_ready/` contains **52K+ rows** across S&P 500 and Russell 2000 with **50 features** (analyst estimates, revision momentum, profit margins, price changes)
 - `modeling.ipynb` has a full ML pipeline with temporal splits, calibration, threshold optimization
-- `notebooks/` has the conceptual strategy notebook (Black-Scholes, IV crush explanation)
+- `option_volatility_crush.ipynb/` has the conceptual strategy notebook (Black-Scholes, IV crush explanation)
 
 **The gap:** No implied volatility / options data, no vol crush trade simulation, no strategy P&L evaluation.
 
